@@ -1,0 +1,363 @@
+# ---------------- E03 ----------------
+- id: S03.1
+  title: Vendor career-ops and wrap doctor
+  pts: 2
+  deps: [S00.2]
+  story: As the builder, I want career-ops pinned as a submodule with a health check so that upgrades are deliberate and breakage is caught immediately.
+  context: vendor/career-ops at the SHA from S00.2. Bridge exposes health() wrapping `npm run doctor`. An upgrade script bumps the SHA and runs the career-ops contract suite.
+  ac:
+    - Bridge health reports doctor result and SHA
+    - "`make upgrade-careerops SHA=…` fails if any contract test fails"
+  tasks:
+    - t: Submodule + install in bridge image
+      red: ["test_vendor.py — submodule SHA equals pinned value in versions.toml"]
+      green: git submodule; Dockerfile installs node deps + chromium
+    - t: doctor wrapper
+      red: ["test_doctor_wrapper.py — parses doctor output into Health(ok, checks[])"]
+      green: health() implementation
+    - t: Upgrade script
+      red: ["test_upgrade_script.py — with a fake SHA whose fixtures break schema, script exits non-zero"]
+      green: scripts/upgrade_careerops.sh
+  tests:
+    - [component, "Given the bridge container, When health() called, Then ok=True and sha matches"]
+    - [unit, "Given doctor output with one failing check, When parsed, Then ok=False and the check named"]
+  dod: ["docs/careerops-upgrade.md"]
+  risks: None.
+
+- id: S03.2
+  title: Profile and master CV as the single source
+  pts: 3
+  deps: [S03.1, S01.1]
+  story: As Doc, I want one master CV and profile that every artifact derives from so that nothing is invented and updates propagate.
+  context: "Master CV (markdown) + config/profile.yml live in a private `profile/` directory mounted into the bridge (not in repo). Bridge validates structure, computes a content hash, and parses the CV into a claim inventory (roles, dates, achievements, metrics, skills, publications) used for provenance checks (S03.4)."
+  ac:
+    - Validation errors are line-referenced
+    - Claim inventory extracted with stable IDs
+    - Master CV hash recorded on every artifact version
+  tasks:
+    - t: Profile + CV validation
+      red: ["test_profile_validate.py — fixture profile valid; missing contact block fails with line number"]
+      green: validator
+    - t: Claim inventory extraction
+      red: ["test_claims.py — fixture CV yields expected claim IDs for roles, metrics, publications"]
+      green: claims.py (markdown AST)
+    - t: Hash + change detection
+      red: ["test_cv_hash.py — editing a bullet changes hash; reformatting whitespace does not"]
+      green: Normalized hash
+  tests:
+    - [unit, "Given a CV bullet with a metric ('cut cost 40%'), When extracted, Then claim type=metric with value 40%"]
+    - [unit, "Given duplicated role headings, When validated, Then warning with both line numbers"]
+    - [component, "Given master CV changes, When bridge restarts, Then new hash exposed and old artifacts flagged stale"]
+  dod: ["profile/ is gitignored and mounted read-only"]
+  risks: Doc's real CV never enters fixtures — synthetic only.
+
+- id: S03.3
+  title: Evaluation contract (A–F scoring)
+  pts: 5
+  deps: [S03.2, S01.4]
+  story: As the Scout, I want to evaluate a job with career-ops' evaluation logic and get back a validated, structured report so that the Manager can route on it.
+  context: "Per ADR-3 the Scout's Hermes session loads career-ops' evaluation mode as a skill and reasons over JD + profile. It submits via careerops.submit_evaluation(job_id, report), which validates against evaluation.schema.json (grade A–F, score 1–5, per-dimension scores, rationale, red flags, comp estimate) and attaches to the ledger. careerops.get_evaluation_context(job_id) returns JD + profile excerpt + mode prompt version."
+  ac:
+    - Invalid reports rejected with schema path errors so the agent can retry
+    - Report records mode prompt version and model id
+    - Evaluation attached and job transitioned to EVALUATED atomically
+  tasks:
+    - t: Evaluation context tool
+      red: ["test_eval_context.py — returns JD markdown, profile excerpt, mode text and version hash"]
+      green: get_evaluation_context
+    - t: Submit + validate
+      red: ["test_eval_submit.py — valid fixture report accepted; grade 'Z' rejected with path '$.grade'"]
+      green: submit_evaluation
+    - t: Atomic attach + transition
+      red: ["test_eval_atomic.py — failure during transition leaves no evaluation row"]
+      green: Single DB transaction
+    - t: Mode-as-skill packaging
+      red: ["test_skill_pack.py — generated SKILL.md embeds the evaluation mode text and output schema"]
+      green: Build step generating paperclip/skills/careerops-evaluate/SKILL.md from vendor modes
+  tests:
+    - [contract, "Given S00.2 captured evaluation, When submitted, Then accepted"]
+    - [component, "Given a report missing rationale, When submitted, Then error lists '$.rationale' required"]
+    - [component, "Given job already EVALUATED, When submitted again, Then new evaluation version stored and latest pointer updated (no duplicate transition)"]
+    - [unit, "Given vendor mode file changes, When skill rebuilt, Then version hash changes"]
+  dod: ["Evaluation schema versioned"]
+  risks: Model may produce inconsistent scores — measured in S06.4.
+
+- id: S03.4
+  title: Tailoring contract with provenance (no fabrication)
+  pts: 8
+  deps: [S03.2, S03.3]
+  story: As Doc, I want tailored CVs and cover letters that only use facts from my master CV so that I never send something untrue.
+  context: "Tailor loads career-ops' CV/cover-letter mode as a skill, produces markdown/HTML, and submits via careerops.submit_artifacts(job_id, cv, cover_letter, claim_map). claim_map links every factual sentence to master-CV claim IDs. The bridge runs a provenance check: unmapped factual sentences, numbers not present in the master CV, employers/titles/dates not in inventory → rejected."
+  ac:
+    - Submission rejected when any factual sentence lacks a claim mapping
+    - Any number, employer, title or date not in the claim inventory → rejected with the offending span
+    - Seeded fabrication fixtures — 100% caught
+  tasks:
+    - t: Fabrication fixture set
+      red: ["test_fabrication_fixtures.py — ≥ 30 seeded cases across numbers, employers, dates, titles, degrees, publications"]
+      green: fixtures/careerops/fabrication/*.md with expected violations
+    - t: Sentence segmentation + factual classifier (deterministic first)
+      red: ["test_factual.py — sentences with numbers, proper nouns, dates are flagged factual; stylistic ones not"]
+      green: spaCy-based rules
+    - t: Provenance checker
+      red: ["test_provenance.py — every fabrication fixture yields its expected violation; clean fixtures pass"]
+      green: provenance.py
+    - t: submit_artifacts tool
+      red: ["test_submit_artifacts.py — rejected payload returns violations list; accepted payload creates ArtifactVersion"]
+      green: Tool + ledger attach
+  tests:
+    - [guardrail, "Given a CV claiming '12 years at Acme' when master says 8, When submitted, Then rejected with span '12 years'"]
+    - [guardrail, "Given an employer not in the inventory, When submitted, Then rejected"]
+    - [guardrail, "Given a metric '45% reduction' when master says 40%, When submitted, Then rejected"]
+    - [unit, "Given a rephrased but faithful bullet mapped to claim R3-B2, When checked, Then passes"]
+    - [eval, "Given the full fabrication set, When checked, Then recall = 1.0 and clean-set false positives ≤ 5%"]
+  dod: ["Provenance check cannot be disabled by tool args"]
+  risks: Over-strict checker frustrates Tailor — measured FP rate; Critic gives second opinion.
+
+- id: S03.5
+  title: PDF rendering and ATS check
+  pts: 3
+  deps: [S03.4]
+  story: As Doc, I want each approved-for-review CV rendered to PDF with career-ops' template and verified as machine-readable so that ATS parsers read it correctly.
+  context: careerops.render_pdf(artifact_version_id) calls career-ops' Playwright PDF script. ATS check extracts text (pdfminer) and verifies section order, contact info, no text-in-images, page count limit.
+  ac:
+    - PDF stored with hash and linked to the artifact version
+    - ATS check results stored; failing PDFs flagged for Critic
+  tasks:
+    - t: Render wrapper
+      red: ["test_render.py — fixture markdown renders to PDF with 1–2 pages"]
+      green: Subprocess wrapper with timeout
+    - t: ATS checker
+      red: ["test_ats.py — fixture with image-only header fails; clean passes; name/email/phone extracted"]
+      green: ats.py
+  tests:
+    - [component, "Given a tailored CV version, When render_pdf, Then PDF exists, hash stored, page_count ≤ 2"]
+    - [unit, "Given extracted text missing email, When ATS-checked, Then finding 'contact_missing'"]
+    - [component, "Given Playwright hangs, When timeout hit, Then RenderError and no partial file stored"]
+  dod: ["Rendering runs in the bridge container only"]
+  risks: Chromium memory on Spark — limit concurrency to 2.
+
+- id: S03.6
+  title: Tracker reconciliation (career-ops ↔ ledger)
+  pts: 3
+  deps: [S03.1, S01.3]
+  story: As Doc, I want career-ops' own tracker kept consistent with the ledger so that career-ops dashboards and tools still work without becoming a second truth.
+  context: Ledger wins. A one-way projection writes tracker rows from ledger state (using career-ops' status vocabulary via a mapping); a read-back detects manual edits and raises a reconciliation item for Doc instead of silently overwriting.
+  ac:
+    - Status mapping covers every ledger state
+    - Manual tracker edits surface as reconciliation items
+  tasks:
+    - t: Status mapping
+      red: ["test_status_map.py — every ledger state maps; unknown raises"]
+      green: mapping.yaml
+    - t: Projection writer
+      red: ["test_tracker_write.py — ledger snapshot → tracker file equals golden output"]
+      green: writer using career-ops tracker format from S00.2
+    - t: Drift detector
+      red: ["test_tracker_drift.py — edited row produces ReconciliationItem with before/after"]
+      green: detector
+  tests:
+    - [contract, "Given golden tracker from S00.2, When parsed and re-written, Then byte-identical"]
+    - [component, "Given ledger APPLIED and tracker says 'Evaluated', When reconcile, Then tracker updated and event logged"]
+    - [component, "Given tracker manually changed to 'Interview', When reconcile, Then ReconciliationItem created; tracker not overwritten until resolved"]
+  dod: []
+  risks: Tracker format changes upstream — covered by contract test.
+
+- id: S03.7
+  title: career-ops portal scanning as a second discovery source
+  pts: 3
+  deps: [S03.1, S02.3]
+  story: As the Scout, I want career-ops' company-portal scanner as a discovery source so that roles posted only on company career pages are found.
+  context: careerops.scan(companies[]) runs the scanner; results normalized into Job and passed through the same dedup and hard filters as JobSpy (source='careerops_scan').
+  ac:
+    - Scan results dedup against JobSpy results
+    - Target company list is config (portals.yaml), approval-gated like profiles
+  tasks:
+    - t: Scan wrapper + normalization
+      red: ["test_scan_normalize.py — captured scan output → Jobs with source='careerops_scan'"]
+      green: scan()
+    - t: Shared dedup/filter pipeline
+      red: ["test_scan_dedup.py — same job found by indeed and scan → one Job with both sources"]
+      green: Reuse S02.3/S02.5 pipeline
+  tests:
+    - [contract, "Given S00.2 scan fixture, When normalized, Then all rows valid Jobs"]
+    - [component, "Given scanner failure for one company, When scan runs, Then other companies processed and failure recorded"]
+  dod: []
+  risks: Portal HTML changes — upstream concern; isolate per company.
+
+- id: S03.8
+  title: careerops-mcp tool surface
+  pts: 3
+  deps: [S03.3, S03.4, S03.5, S03.6, S03.7]
+  story: As the Scout, Tailor and Critic, I want career-ops capabilities as one MCP server with per-agent permissions so that each agent sees only what it needs.
+  context: "Tools: health, profile.get_summary, evaluate.get_context, evaluate.submit, tailor.get_context, tailor.submit, render_pdf, artifacts.read, scan, tracker.reconcile. Allow-lists: Scout(evaluate.*, scan), Tailor(profile.*, tailor.*, render_pdf), Critic(artifacts.read, profile.get_summary), Manager(health, tracker.reconcile)."
+  ac:
+    - Allow-lists enforced server-side with tests per agent
+    - Tool docs generated to SKILL.md files
+  tasks:
+    - t: Server and registry
+      red: ["test_careerops_mcp_schema.py — tool names/schemas"]
+      green: FastMCP server composing bridge functions
+    - t: Allow-lists
+      red: ["test_careerops_mcp_authz.py — matrix test of every (agent, tool) pair"]
+      green: authz config
+  tests:
+    - [guardrail, "Given the critic's key, When calling tailor.submit, Then PermissionDenied"]
+    - [guardrail, "Given the scout's key, When calling render_pdf, Then PermissionDenied"]
+    - [contract, "Given each tool, When called with fixture inputs, Then outputs validate against schemas"]
+  dod: ["Authz matrix rendered into docs/permissions.md"]
+  risks: None.
+
+# ---------------- E04 ----------------
+- id: S04.1
+  title: Install Paperclip and Hermes with LiteLLM as provider
+  pts: 3
+  deps: [S00.3, S00.5]
+  story: As Doc, I want Paperclip and Hermes running on the Spark with all model traffic going through LiteLLM so that models are swappable and spend is attributable.
+  context: Paperclip container at pinned version. Hermes installed in the same container (hermes_local requires same machine), ~/.hermes/config.yaml pointing at LiteLLM's OpenAI-compatible endpoint. MCP servers registered in Hermes config per agent profile.
+  ac:
+    - "`hermes chat -q 'ping'` inside the container returns via LiteLLM"
+    - Paperclip health + adapter testEnvironment pass
+  tasks:
+    - t: Container image
+      red: ["test_image.py — image contains hermes binary at pinned version and paperclip at pinned version"]
+      green: Dockerfile.paperclip
+    - t: Hermes → LiteLLM config
+      red: ["test_hermes_litellm.py — hermes ping through mock route returns scripted reply"]
+      green: config template rendered from env
+    - t: Adapter testEnvironment check
+      red: ["test_adapter_env.py — Paperclip adapter environment test reports ok"]
+      green: Register hermes_local
+  tests:
+    - [integration, "Given the stack up, When adapter environment test runs, Then ok"]
+    - [integration, "Given LiteLLM down, When hermes ping, Then fails fast with clear error within timeout"]
+  dod: ["Versions in versions.toml"]
+  risks: None.
+
+- id: S04.2
+  title: Fake Hermes harness
+  pts: 5
+  deps: [S00.3]
+  story: As the builder, I want a scriptable fake Hermes CLI so that Paperclip orchestration and agent tool-call sequences can be tested deterministically without any LLM.
+  context: "fakes/fake-hermes: accepts the same CLI args as `hermes chat -q`, reads a scenario file (keyed by agent + wake reason + task label) that lists MCP tool calls to make and the final message to print. It actually calls the MCP servers, so component tests see real side effects. Supports --resume to assert session continuity."
+  ac:
+    - Paperclip runs fake-hermes via hermesCommand; runs appear in UI with transcripts
+    - Scenarios can assert expected tool results and fail the run on mismatch
+  tasks:
+    - t: CLI arg compatibility
+      red: ["test_fake_cli.py — accepts -q, -m, --resume, --max-turns; unknown flag error mirrors real CLI"]
+      green: fake-hermes entrypoint
+    - t: Scenario DSL + MCP client
+      red: ["test_scenarios.py — scenario calls ledger.get_job and asserts state; mismatch exits non-zero"]
+      green: YAML scenario runner
+    - t: Paperclip integration fixture
+      red: ["tests/integration/test_fake_hermes_paperclip.py — assign issue → fake run → comment posted"]
+      green: pytest fixture spinning compose.test.yml with hermesCommand override
+  tests:
+    - [integration, "Given scenario 'scout-hello', When issue assigned to Scout, Then a run completes and the issue has comment 'hello'"]
+    - [component, "Given scenario expecting state EVALUATED but ledger says DISCOVERED, When run, Then exit code 2 and Paperclip marks run failed"]
+    - [unit, "Given --resume <id>, When run twice, Then session file shows 2 turns"]
+  dod: ["docs/testing-with-fake-hermes.md"]
+  risks: Fake drifts from real CLI — S04.1 contract test compares arg parsers on upgrade.
+
+- id: S04.3
+  title: Company-as-code (apply + drift)
+  pts: 5
+  deps: [S04.1, S00.3]
+  story: As Doc, I want the JobOps company, agents, reporting lines and settings declared in YAML and applied idempotently so that the setup is reproducible and reviewable.
+  context: "paperclip/company.yaml: company (name, mission, goals), projects (Discovery, Applications, Inbox), agents (name, role, reportsTo, adapterType hermes_local, adapterConfig: model, toolsets, timeoutSec, persistSession, promptTemplate ref, env incl. per-agent LiteLLM key + MCP creds), budgets, heartbeat schedules. `jobops company apply|diff`."
+  ac:
+    - apply on empty Paperclip creates everything; second apply is a no-op
+    - diff shows UI-made changes as drift
+    - Secrets referenced, never inlined
+  tasks:
+    - t: Schema + loader
+      red: ["test_company_schema.py — sample validates; agent reportsTo unknown fails"]
+      green: company schema
+    - t: Apply via REST
+      red: ["test_company_apply.py — against recorded API fixtures, apply produces expected call sequence; second apply makes zero mutating calls"]
+      green: apply command
+    - t: Drift detection
+      red: ["test_company_diff.py — server state with changed budget → diff reports field-level change"]
+      green: diff command
+  tests:
+    - [integration, "Given empty Paperclip, When apply, Then 5 agents exist with correct reporting lines (Manager → board; others → Manager)"]
+    - [integration, "Given applied company, When apply again, Then no changes"]
+    - [unit, "Given a literal API key in company.yaml, When validated, Then error 'secrets must be references'"]
+  dod: ["company.yaml reviewed by Doc"]
+  risks: Paperclip API churn — pinned version + fixtures.
+
+- id: S04.4
+  title: Prompt templates and skills packaging
+  pts: 5
+  deps: [S04.3, S01.4]
+  story: As each agent, I want a role-specific prompt template and skills so that every heartbeat starts with my mission, my tools and my rules.
+  context: "prompts/<agent>.hbs use hermes_local variables ({{agentName}}, {{taskId}}, {{taskTitle}}, {{taskBody}}, {{wakeReason}}, {{commentId}}, {{#noTask}}…). Skills: paperclip/skills/* (SKILL.md: ledger tools, careerops modes, review rubric, inbox handling, issue conventions, safety rules). Synced via adapter listSkills/syncSkills."
+  ac:
+    - Template renders for every wake reason without missing variables
+    - Each agent's enabled skill set matches company.yaml
+    - Safety rules skill is enabled for every agent and cannot be toggled off by apply
+  tasks:
+    - t: Template rendering tests
+      red: ["test_templates.py — render each template with (assignment, comment, heartbeat-noTask) contexts; snapshot tests"]
+      green: prompts/*.hbs
+    - t: Skill packaging + sync
+      red: ["test_skills_sync.py — after apply, listSkills for each agent equals expected set"]
+      green: skills build + sync step
+    - t: Mandatory safety skill
+      red: ["test_safety_skill.py — company.yaml without safety skill on an agent → apply adds it and warns"]
+      green: apply invariant
+  tests:
+    - [unit, "Given wakeReason=heartbeat and no task, When Manager template renders, Then 'sweep' instructions section present and task section absent"]
+    - [integration, "Given apply, When listing Critic skills, Then includes review-rubric and safety-rules, excludes careerops-tailor"]
+    - [unit, "Given a template referencing {{unknownVar}}, When linted, Then fails"]
+  dod: ["Prompt version hash recorded on every run (used by S11.2)"]
+  risks: Prompt drift — versioned and snapshot-tested.
+
+- id: S04.5
+  title: Budgets, heartbeats and least-privilege toolsets
+  pts: 3
+  deps: [S04.3]
+  story: As Doc, I want each agent to have a budget, a schedule and only the tools it needs so that cost and blast radius are bounded.
+  context: "Paperclip budgets per agent (soft warning at 80%, hard stop at 100%). Heartbeats: Manager 2h, Scout 12h, Concierge 30m, Tailor/Critic on-assignment only. Hermes toolsets restricted (e.g. no terminal/browser for Critic/Concierge; MCP only). LiteLLM per-key max budget as a second limit."
+  ac:
+    - Budget exhaustion pauses the agent and notifies Doc
+    - Toolsets per agent verified by test
+  tasks:
+    - t: Budget config + test
+      red: ["tests/integration/test_budget_stop.py — set Scout budget tiny; run fake scenario reporting cost; next assignment blocked"]
+      green: Budgets in company.yaml
+    - t: Toolset restriction
+      red: ["test_toolsets.py — Concierge adapterConfig toolsets == 'mcp'; Tailor excludes 'browser'"]
+      green: toolsets per agent
+    - t: Heartbeat schedule
+      red: ["test_heartbeats.py — apply sets schedules; diff detects changes"]
+      green: schedule config
+  tests:
+    - [integration, "Given Scout at 100% budget, When assigned, Then run blocked and Doc notified"]
+    - [guardrail, "Given Concierge config, When inspected, Then terminal, browser and code_execution toolsets are disabled"]
+  dod: ["Budget defaults agreed with Doc"]
+  risks: None.
+
+- id: S04.6
+  title: Issue conventions library
+  pts: 3
+  deps: [S04.3, S01.1]
+  story: As the Manager and each specialist, I want a standard issue format linked to ledger jobs so that every unit of work is traceable and machine-parseable.
+  context: "Issue title `[<STAGE>] <Company> — <Role>`; body starts with YAML front-matter (job_id, stage, ledger_version, parent_issue, attempt) then human-readable context. Labels: stage:*, tier:*, agent:*. Library (TS + Python) to create, parse and update."
+  ac:
+    - Round-trip create → parse returns the same metadata
+    - Malformed front-matter detected and reported to Manager
+  tasks:
+    - t: Format + parser
+      red: ["test_issue_format.py — round-trip; property test on arbitrary company names (unicode, em dashes)"]
+      green: issue_format.py / issueFormat.ts
+    - t: API helpers
+      red: ["test_issue_api.py — create child issue with parent link against fixtures"]
+      green: helpers
+  tests:
+    - [unit, "Given metadata with company 'Müller & Co — EU', When rendered and parsed, Then identical"]
+    - [unit, "Given body without front-matter, When parsed, Then MalformedIssue"]
+    - [contract, "Given create_child_issue, When called, Then request matches recorded Paperclip fixture"]
+  dod: ["Issue conventions SKILL.md"]
+  risks: None.

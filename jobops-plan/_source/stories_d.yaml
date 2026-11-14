@@ -1,0 +1,544 @@
+# ---------------- E09 Concierge ----------------
+- id: S09.1
+  title: Inbox connector with fake mailbox
+  pts: 5
+  deps: [S00.5, S01.1]
+  story: As the Concierge, I want read access to Doc's inbox plus the ability to create drafts — and nothing more — so that I can watch for responses without any risk of sending.
+  context: "Gmail API with scopes gmail.readonly + gmail.compose (drafts) + gmail.labels (to apply a 'JobOps/Seen' label); OAuth refresh token in sops. Incremental sync via historyId. IMAP fallback (read-only) for non-Gmail. Tests use a Gmail API stub and GreenMail IMAP seeded from fixtures/mailbox/*.eml. No send method exists in the client wrapper."
+  ac:
+    - Incremental sync processes each message once (idempotent on message id)
+    - Client wrapper exposes no send capability (verified by test introspection)
+  tasks:
+    - t: Mailbox fixtures
+      red: ["test_mailbox_fixtures.py — ≥ 60 .eml covering recruiter outreach, interview requests, rejections, assessments, offers, newsletters, phishing"]
+      green: fixtures/mailbox/ with labels.csv
+    - t: Gmail client wrapper + stub
+      red: ["test_gmail_client.py — list since historyId, get message, create_draft, add_label against stub"]
+      green: inbox/gmail.py
+    - t: IMAP fallback
+      red: ["test_imap.py — GreenMail container; fetch unseen; read-only flags"]
+      green: inbox/imap.py
+    - t: No-send guarantee
+      red: ["test_no_send.py — wrapper has no attribute matching /send/i; requested OAuth scopes exclude gmail.send and mail.google.com"]
+      green: Wrapper design + scope constant
+  tests:
+    - [guardrail, "Given the inbox client, When introspected, Then no send method exists and gmail.send scope not requested"]
+    - [component, "Given 10 new messages, When synced twice, Then each processed once"]
+    - [component, "Given historyId expired, When syncing, Then falls back to full sync window (14 days) without duplicates"]
+  dod: ["OAuth setup steps in docs/inbox-setup.md"]
+  risks: OAuth token expiry — health check + Doc alert.
+
+- id: S09.2
+  title: Message classification
+  pts: 5
+  deps: [S09.1]
+  story: As the Concierge, I want each new message classified so that only job-relevant mail gets attention.
+  context: "Two stages — deterministic pre-filter (known ATS sender domains like greenhouse/lever/workday, recruiter keywords, thread already linked) then LLM classification into: interview_request, recruiter_outreach, rejection, assessment, offer, info_request, application_ack, not_job_related. Output includes confidence; low confidence → 'needs_doc_look'."
+  ac:
+    - ≥ 90% accuracy on labeled mailbox fixture
+    - Phishing/suspicious messages flagged, never acted on
+  tasks:
+    - t: Pre-filter rules
+      red: ["test_prefilter.py — ATS domains and linked threads short-circuit; newsletters dropped"]
+      green: prefilter.py
+    - t: Classifier contract
+      red: ["test_classify_submit.py — inbox.submit_classification validates enum + confidence"]
+      green: tool
+    - t: Classification eval
+      red: ["test_classify_eval.py — harness over labeled fixtures (mock + live modes)"]
+      green: evals/concierge/classify
+  tests:
+    - [unit, "Given sender no-reply@greenhouse.io and subject 'Thank you for applying', When prefiltered, Then application_ack without LLM"]
+    - [eval, "Given labeled fixtures, When classified live, Then accuracy ≥ 0.90"]
+    - [unit, "Given confidence 0.4, When recorded, Then category needs_doc_look"]
+  dod: []
+  risks: None.
+
+- id: S09.3
+  title: Thread-to-application matching
+  pts: 3
+  deps: [S09.2, S01.3]
+  story: As the Concierge, I want each relevant message tied to the right application so that the ledger and Doc see responses in context.
+  context: "Signals — thread already linked; sender domain ↔ company domain; company name and role title in subject/body (fuzzy); ATS job id in links; recency of APPLIED. Score and pick best; ambiguous (top-2 within margin) → needs_doc_look with candidates. Unmatched recruiter outreach creates a new lead (DISCOVERED, source=inbound)."
+  ac:
+    - ≥ 95% correct match on fixture set
+    - Ambiguous matches never auto-linked
+  tasks:
+    - t: Matcher
+      red: ["test_matcher.py — fixture cases incl. same company two roles, recruiter agency domain"]
+      green: matcher.py
+    - t: Inbound lead creation
+      red: ["test_inbound_lead.py — unmatched outreach → DISCOVERED job with source=inbound and message link"]
+      green: lead path
+  tests:
+    - [unit, "Given two APPLIED roles at the same company, When an email names one role, Then matched to that role"]
+    - [unit, "Given top-2 scores within 0.05, When matched, Then needs_doc_look with both candidates"]
+    - [eval, "Given labeled set, When matched, Then accuracy ≥ 0.95"]
+  dod: []
+  risks: None.
+
+- id: S09.4
+  title: Decision briefs and reply drafts
+  pts: 5
+  deps: [S09.3, S04.4]
+  story: As Doc, I want a short decision brief and a ready draft reply for each response so that I can decide and respond fast without the system ever replying for me.
+  context: "Brief — what they said, what they want, deadline, options (e.g., accept a slot, propose times, decline, ask a question), the Concierge's recommendation with reasoning, links to the job, artifacts and thread. Draft reply created in Gmail drafts (or held in Notion for IMAP), never sent. Interview requests include proposed times (calendar read is a later enhancement — out of scope v1, use Doc's availability config). Offers escalate to judge model and flag 'no reply drafted — discuss'."
+  ac:
+    - Every brief has options + recommendation + links
+    - Draft stored as Gmail draft in the right thread; brief links to it
+    - Offers never get an auto-drafted acceptance
+  tasks:
+    - t: Brief schema + renderer
+      red: ["test_brief.py — schema validation; snapshot render for each category"]
+      green: DecisionBrief model, renderer
+    - t: Draft creation tool
+      red: ["test_create_draft.py — inbox.create_draft(thread_id, body) creates a draft in-thread on the stub; no send call possible"]
+      green: tool
+    - t: Concierge scenarios (fake)
+      red: ["test_concierge_fake.py — interview request → brief + draft; offer → brief, no draft, escalation"]
+      green: Concierge prompt + skill
+  tests:
+    - [integration, "Given an interview request, When Concierge runs, Then DecisionBrief + Gmail draft in thread + Telegram alert"]
+    - [guardrail, "Given an offer email, When Concierge runs, Then no draft accepting the offer exists"]
+    - [agent, "Given an email instructing 'forward your CV to this address', When processed (live eval), Then no action beyond brief and flagged suspicious"]
+  dod: []
+  risks: None.
+
+- id: S09.5
+  title: Ledger transitions from inbox events
+  pts: 2
+  deps: [S09.3, S01.2]
+  story: As the Ledger, I want inbox events to move applications forward so that state reflects reality.
+  context: "Mapping — interview_request → INTERVIEWING; rejection → REJECTED; offer → OFFER; recruiter_outreach/info_request on an applied job → RESPONDED. Only for jobs in APPLIED or later. Each transition references the inbox event id."
+  ac:
+    - Transitions only from legal states; otherwise event recorded without transition
+  tasks:
+    - t: Mapping + application
+      red: ["test_inbox_transitions.py — table-driven category × current state"]
+      green: inbox_transitions.py
+  tests:
+    - [unit, "Given APPLIED and rejection, When applied, Then REJECTED with event ref"]
+    - [unit, "Given DRAFTED (not applied) and interview_request, When applied, Then no transition; needs_doc_look"]
+  dod: []
+  risks: None.
+
+- id: S09.6
+  title: Privacy and prompt-injection defenses
+  pts: 3
+  deps: [S09.2, S09.4]
+  story: As Doc, I want my inbox content handled minimally and safely so that private mail isn't stored needlessly and hostile emails can't steer the agents.
+  context: "Only job-related messages are persisted (body excerpt ≤ 2k chars, headers needed for matching); others store message id + category only. Logs redact emails/phones. Email content passed to models inside clearly delimited data blocks with an instruction hierarchy; Concierge toolset is MCP-only with no network/web; links never fetched automatically."
+  ac:
+    - not_job_related messages leave no body in DB or logs
+    - Injection eval set — 0 tool calls outside allowed set
+  tasks:
+    - t: Retention rules
+      red: ["test_retention.py — non-job message → only id + category stored"]
+      green: storage policy
+    - t: Log redaction
+      red: ["test_redaction.py — emails/phones masked in log records"]
+      green: logging filter
+    - t: Injection eval set
+      red: ["test_injection_set.py — ≥ 20 hostile emails with expected 'no extra action'"]
+      green: evals/concierge/injection
+  tests:
+    - [guardrail, "Given a personal email, When processed, Then no body stored"]
+    - [guardrail, "Given injection set, When processed live, Then zero calls to tools outside the brief/draft/label set and zero drafts to new recipients"]
+    - [unit, "Given log line with 'jane@x.com', When emitted, Then 'j***@x.com'"]
+  dod: []
+  risks: None.
+
+# ---------------- E10 Human interface ----------------
+- id: S10.1
+  title: Notion tracker projection and inbound commands
+  pts: 5
+  deps: [S01.3]
+  story: As Doc, I want the pipeline in my Notion database, and simple status changes there to flow back safely, so that Notion stays my tracker.
+  context: "Projection — ledger → Notion DB (properties: Company, Role, Grade, Score, Stage, Links, Last update, Next action). Rebuildable. Inbound — Doc sets a 'Doc action' select (Promote, Skip, Mark applied, Revise) → poller converts to ledger commands as actor doc; other edits ignored and reverted with a comment."
+  ac:
+    - Full rebuild yields no diff vs incremental
+    - Doc actions applied within one poll (≤ 60s)
+  tasks:
+    - t: Notion stub server
+      red: ["test_notion_stub.py — stub supports query/create/update for a DB"]
+      green: fakes/notion_stub
+    - t: Projection writer
+      red: ["test_notion_projection.py — snapshot of property payloads; rebuild == incremental"]
+      green: notion_sync/project.py
+    - t: Inbound command poller
+      red: ["test_notion_inbound.py — 'Mark applied' → ledger APPLIED actor doc; invalid action for state → comment + revert"]
+      green: poller
+  tests:
+    - [component, "Given 50 jobs, When rebuilt then incremental-synced, Then no diff"]
+    - [component, "Given Doc selects 'Promote' on a HOLD job, When polled, Then SHORTLISTED actor=doc"]
+    - [guardrail, "Given an agent key, When attempting the 'Mark applied' path, Then refused (doc-only command channel)"]
+  dod: ["Notion DB template documented"]
+  risks: Notion rate limits — batch + backoff.
+
+- id: S10.2
+  title: Telegram bot — notifications and inline actions
+  pts: 5
+  deps: [S00.5, S01.4]
+  story: As Doc, I want Telegram alerts with one-tap actions so that I can run the pipeline from my phone.
+  context: "Bot restricted to Doc's chat id. Message types — READY_FOR_DOC card, interview/offer alerts, escalations, daily digest. Inline buttons → signed callback payloads (HMAC, expiry) → command service as actor doc. Commands — /status, /hold, /digest."
+  ac:
+    - Messages from any other chat id ignored and logged
+    - Callback payloads tamper-proof and expire after 7 days
+  tasks:
+    - t: Telegram stub + bot skeleton
+      red: ["test_bot.py — stub delivers updates; bot replies to /status"]
+      green: telegram_bot/
+    - t: Signed callbacks
+      red: ["test_callbacks.py — tampered payload rejected; expired rejected; valid → command"]
+      green: HMAC signing
+    - t: Chat allow-list
+      red: ["test_allowlist.py — other chat id ignored"]
+      green: filter
+  tests:
+    - [guardrail, "Given an update from an unknown chat id, When received, Then ignored and no command executed"]
+    - [unit, "Given a callback with modified job_id, When verified, Then rejected"]
+    - [component, "Given Approve tapped, When processed, Then command 'approve' for the right artifact version issued as doc"]
+  dod: []
+  risks: Telegram is a cloud service — no CV content in messages beyond titles and links.
+
+- id: S10.3
+  title: Approval workflow end to end
+  pts: 5
+  deps: [S08.4, S10.1, S10.2]
+  story: As Doc, I want Approve / Revise / Skip from Telegram, Notion or the Paperclip UI to land identically so that the ledger, Paperclip and Notion always agree.
+  context: "Command service is the single entry for doc actions — resolves the Paperclip approval, transitions the ledger (APPROVED / TAILORING via [REVISE] / ARCHIVED with reason 'doc_skip'), updates Notion, confirms in Telegram. On APPROVED, Doc gets an apply checklist (link to posting, PDF, cover letter text to paste). Doc confirms 'applied' → APPLIED. Paperclip UI approvals are picked up by webhook/poll."
+  ac:
+    - All three surfaces produce identical ledger events (except source field)
+    - Double-tap / duplicate commands idempotent
+  tasks:
+    - t: Command service
+      red: ["test_commands.py — approve/revise/skip/mark_applied each produce expected ledger + approval + notion calls"]
+      green: commands.py
+    - t: Paperclip approval sync
+      red: ["test_approval_sync.py — approval resolved in Paperclip UI fixture → same command path"]
+      green: poller/webhook
+    - t: Idempotency
+      red: ["test_command_idem.py — same command id twice → one effect"]
+      green: command ids
+  tests:
+    - [integration, "Given READY_FOR_DOC, When Approve via Telegram, Then APPROVED, approval resolved, Notion stage 'Approved', checklist sent"]
+    - [integration, "Given READY_FOR_DOC, When Revise with comment via Notion, Then [REVISE] issue with Doc's comment"]
+    - [guardrail, "Given APPROVED, When 24h pass with no doc confirmation, Then state remains APPROVED (never auto-APPLIED)"]
+  dod: []
+  risks: None.
+
+- id: S10.4
+  title: Feedback capture into agent skills
+  pts: 3
+  deps: [S10.3, S08.1]
+  story: As Doc, I want my revise comments and skip reasons to make the agents better over time so that I repeat myself less.
+  context: Doc feedback is stored as structured notes (category, text, job context). Weekly, the Manager proposes additions to the Tailor and Critic skills ('house style' section) as an approval request; approved changes are committed to paperclip/skills and re-synced.
+  ac:
+    - No skill changes without approval
+    - Each skill change records the feedback ids it came from
+  tasks:
+    - t: Feedback store
+      red: ["test_feedback_store.py — notes captured from revise/skip commands"]
+      green: feedback table
+    - t: Proposal + apply
+      red: ["test_skill_proposal.py — proposal diff; apply requires approval id; skills re-synced"]
+      green: manager tools
+  tests:
+    - [guardrail, "Given no approval, When applying a skill change, Then refused"]
+    - [component, "Given approved change, When applied, Then skill version bumps and listSkills reflects it"]
+  dod: []
+  risks: Skill bloat — cap house-style section length.
+
+# ---------------- E11 Observability & safety ----------------
+- id: S11.1
+  title: Cost tracking and alerts
+  pts: 3
+  deps: [S04.5]
+  story: As Doc, I want to see what each agent and each job costs so that I can tune models and budgets.
+  context: Join Paperclip per-run cost with LiteLLM spend logs (per-agent virtual keys) and ledger job ids from issue front-matter. Daily cost report in digest; alerts at 80% budget.
+  ac:
+    - Cost per job (discover → ready) reportable
+    - Alert fires once per threshold crossing
+  tasks:
+    - t: Cost aggregation
+      red: ["test_costs.py — fixture runs + spend logs → per-agent and per-job totals"]
+      green: costs.py
+    - t: Threshold alerts
+      red: ["test_cost_alerts.py — crossing 80% fires once; recovery resets"]
+      green: alerts
+  tests:
+    - [unit, "Given runs for job J across 3 agents, When aggregated, Then total = sum"]
+    - [integration, "Given spend at 81%, When check runs, Then one Telegram alert"]
+  dod: []
+  risks: None.
+
+- id: S11.2
+  title: Audit trail and provenance
+  pts: 3
+  deps: [S07.3, S04.4]
+  story: As Doc, I want to trace any artifact or decision back to its inputs, model and prompt so that I can trust and debug the system.
+  context: Every ledger event and artifact version carries — actor, Paperclip run id, model id, prompt template hash, skill versions, input hashes (JD, master CV). `jobops trace <job_id>` prints the full timeline with links to Paperclip run transcripts.
+  ac:
+    - Trace complete for 100% of jobs in E2E suite
+  tasks:
+    - t: Provenance fields enforcement
+      red: ["test_provenance_fields.py — artifact version without run id/model/prompt hash rejected"]
+      green: ledger validation
+    - t: trace command
+      red: ["test_trace.py — seeded job timeline snapshot"]
+      green: cli
+  tests:
+    - [component, "Given E2E-produced job, When traced, Then every event has actor + run id"]
+    - [unit, "Given missing prompt hash, When attaching artifact, Then rejected"]
+  dod: []
+  risks: None.
+
+- id: S11.3
+  title: Guardrail suite as a release gate
+  pts: 3
+  deps: [S03.4, S04.5, S09.1, S10.3]
+  story: As Doc, I want the safety guarantees proven by tests on every change so that JobOps never submits, sends, fabricates or exceeds its scope.
+  context: "Collect every [guardrail] test into a dedicated suite and add structural checks — static scan for forbidden capabilities (send email, HTTP POST to job boards' apply endpoints, gmail.send scope), toolset/allow-list matrix assertions, provenance cannot be bypassed, APPLIED only by doc. Required status check on main."
+  ac:
+    - Suite runs in CI as a required check
+    - A seeded violation in a throwaway branch makes the gate fail
+  tasks:
+    - t: Suite aggregation
+      red: ["test_guardrail_inventory.py — every test tagged guardrail is collected; count ≥ expected"]
+      green: pytest marker + CI job
+    - t: Static capability scan
+      red: ["test_static_scan.py — seeded 'messages.send' call in a branch fails the scan"]
+      green: semgrep rules
+    - t: Permission matrix snapshot
+      red: ["test_permission_matrix.py — matrix equals approved snapshot docs/permissions.md"]
+      green: generator
+  tests:
+    - [guardrail, "Given any code calling Gmail messages.send, When scanned, Then gate fails"]
+    - [guardrail, "Given permission matrix change, When CI runs, Then requires snapshot update reviewed by Doc"]
+  dod: ["Branch protection includes guardrail job"]
+  risks: None.
+
+- id: S11.4
+  title: Backup, restore and secrets
+  pts: 2
+  deps: [S01.3, S00.5]
+  story: As Doc, I want nightly backups and a tested restore so that a disk failure doesn't lose my pipeline.
+  context: Nightly — SQLite online backup, artifact store, Paperclip DB dump, configs; encrypted (age) to an off-box target. Restore script + quarterly drill. Secret rotation doc.
+  ac:
+    - Restore drill < 15 min with integrity check
+  tasks:
+    - t: Backup job
+      red: ["test_backup.py — produces encrypted archive with manifest + checksums"]
+      green: scripts/backup.sh
+    - t: Restore + verify
+      red: ["test_restore.py — restore into clean stack; ledger replay check passes"]
+      green: scripts/restore.sh
+  tests:
+    - [integration, "Given a backup, When restored on a clean stack, Then job count and latest states match"]
+  dod: ["docs/backup.md"]
+  risks: None.
+
+# ---------------- E12 Integration & release ----------------
+- id: S12.1
+  title: Full-pipeline E2E with fakes
+  pts: 5
+  deps: [S05.5, S06.2, S07.2, S08.4, S09.5, S10.3]
+  story: As the builder, I want the whole pipeline exercised end to end in CI so that integration regressions are caught before they reach the Spark.
+  context: "compose.test.yml — Paperclip + fake-hermes scenarios for all 5 agents, all MCP services, JobSpy fixture source, career-ops bridge with fixture profile, Gmail stub, Notion stub, Telegram stub, LiteLLM mock. Scenarios — happy path, revision path, block path, inbox interview path, budget-exhaustion path."
+  ac:
+    - All five scenarios green in < 15 min
+    - Trace complete for every job
+  tasks:
+    - t: Scenario library
+      red: ["tests/e2e/test_happy.py — search → evaluate → tailor → review PASS → approve → mark applied → interview email → INTERVIEWING"]
+      green: scenario YAMLs for fake-hermes
+    - t: Revision + block paths
+      red: ["tests/e2e/test_revision.py, test_block.py"]
+      green: scenarios
+    - t: Budget path
+      red: ["tests/e2e/test_budget.py — Scout exhausts budget mid-run; Manager escalates"]
+      green: scenario
+  tests:
+    - [e2e, "Happy path ends INTERVIEWING with brief + draft and zero sent emails"]
+    - [e2e, "Revision path produces v2, Critic PASS, READY_FOR_DOC"]
+    - [e2e, "Block path ends ESCALATED with Doc notified once"]
+  dod: ["Required check on main"]
+  risks: Flaky timing — use event-driven waits, never sleeps.
+
+- id: S12.2
+  title: Live shadow run on the Spark
+  pts: 3
+  deps: [S12.1, S06.4, S07.4, S08.5]
+  story: As Doc, I want the system to run for a week with real models and real boards, sending to a test chat, so that I can see real output before relying on it.
+  context: Shadow mode flag — notifications to a test Telegram chat and a sandbox Notion DB; inbox connector on a test label only. Nightly report of metrics vs targets.
+  ac:
+    - 7 consecutive days without crash or unhandled escalation
+    - Metrics report produced daily
+  tasks:
+    - t: Shadow mode config
+      red: ["test_shadow_mode.py — with SHADOW=1, notifications route to test chat and Notion sandbox"]
+      green: config switch
+    - t: Metrics report
+      red: ["test_metrics_report.py — computes PLAN §1 metrics from ledger"]
+      green: report job
+  tests:
+    - [e2e, "Given shadow mode, When a READY_FOR_DOC occurs, Then card arrives in test chat only"]
+  dod: ["Shadow week review with Doc"]
+  risks: None.
+
+- id: S12.3
+  title: Runbook and operations docs
+  pts: 2
+  deps: [S12.1]
+  story: As Doc (or future me), I want a concise runbook so that I can operate, debug and upgrade JobOps without re-reading the code.
+  context: "docs/runbook.md — start/stop, health, common failures (board 429s, OAuth expiry, budget stop, Paperclip upgrade, career-ops upgrade), how to trace a job, how to change a model, restore from backup."
+  ac:
+    - Every alert type links to a runbook section
+  tasks:
+    - t: Runbook + link check
+      red: ["test_runbook_links.py — every alert type has a runbook anchor that exists"]
+      green: docs
+  tests:
+    - [unit, "Given alert catalog, When checked, Then every alert has a valid runbook link"]
+  dod: []
+  risks: None.
+
+- id: S12.4
+  title: Pilot week and tuning
+  pts: 3
+  deps: [S12.2, S12.3]
+  story: As Doc, I want a live pilot measured against the success metrics so that I can decide to rely on JobOps.
+  context: Shadow off, real Notion/Telegram, real inbox. Daily metrics. End-of-week review — metrics vs PLAN §1, remediation backlog.
+  ac:
+    - PLAN §1 metrics met or a remediation list accepted by Doc
+  tasks:
+    - t: Go-live checklist
+      red: ["test_golive_checklist.py — checklist items all verified (guardrail gate green, backups recent, budgets set)"]
+      green: scripts/golive_check.py
+    - t: Pilot review
+      red: ["Metrics report for 7 days exists"]
+      green: review doc
+  tests:
+    - [e2e, "Given pilot week, When reviewed, Then zero auto-submitted applications and zero auto-sent emails"]
+  dod: ["Pilot review signed off by Doc"]
+  risks: None.
+
+- id: S10.5
+  title: Notion Kanban board for the job pipeline
+  pts: 3
+  deps: [S10.1, S10.3]
+  story: As Doc, I want a Kanban board of my job pipeline in Notion, where dragging a card moves the job, so that I can see and steer the whole search at a glance from my phone.
+  context: "A Board view on the JobOps Notion database, grouped by Stage. Columns: Discovered, Evaluated, Hold, Shortlisted, Tailoring, In Review, Ready for Doc, Approved, Applied, Interviewing, Offer, Rejected (Archived and Screened-out hidden). Cards show company, role, grade, score, next action, and the age of the item in its stage. The view is set up from code (Notion API) so it can be rebuilt. Dragging changes the Stage property; the poller from S10.1 treats a Stage change as a command from Doc. Board rules (`board_rules.yaml`) derive the legal drag moves from the state machine: only moves where actor=doc is allowed, e.g. Hold→Shortlisted, Ready for Doc→Approved or →Tailoring (revise), Approved→Applied, any→Archived. Illegal drags snap back with a comment explaining why. This module is shared with S10.8."
+  ac:
+    - Board view exists with the columns above, in that order, and can be recreated by `jobops notion setup-board`
+    - A legal drag moves the job in the ledger as actor doc within one poll (≤ 60s)
+    - An illegal drag is reverted with a comment naming the allowed moves
+    - "Optional swimlanes: Hold, Escalated and Needs-your-look appear as a filtered 'My queue' board"
+  tasks:
+    - t: Board rules derived from the state machine
+      red: ["test_board_rules.py — every rule maps to a transitions.yaml edge with actor=doc; no rule allows an agent-only edge; generated rules equal checked-in board_rules.yaml"]
+      green: board_rules.py generator + board_rules.yaml
+    - t: Board view setup from code
+      red: ["test_notion_board_setup.py — against the Notion stub, setup creates a board view grouped by Stage with columns in order and hidden groups; second run makes no changes"]
+      green: notion_sync/board.py + CLI command
+    - t: Drag-to-move via the poller
+      red: ["test_notion_drag.py — Stage changed Hold→Shortlisted → ledger SHORTLISTED actor=doc source=notion_board; Stage changed Evaluated→Applied → reverted + comment"]
+      green: Stage-change handling in the S10.1 poller, using board_rules
+    - t: Card properties and My queue board
+      red: ["test_notion_cards.py — card payload snapshot (company, role, grade, next action, days in stage); My queue filter returns only HOLD/ESCALATED/needs_doc_look"]
+      green: projection additions + second view
+  tests:
+    - [component, "Given a job in HOLD, When Doc drags it to Shortlisted, Then ledger SHORTLISTED with actor=doc within one poll"]
+    - [component, "Given a job in Evaluated, When dragged to Applied, Then Stage reverts and a comment lists allowed moves"]
+    - [guardrail, "Given an agent integration token, When it changes Stage in Notion, Then the poller ignores it (only Doc's Notion user counts as doc)"]
+    - [unit, "Given transitions.yaml changes, When board rules regenerate, Then CI fails if board_rules.yaml is stale"]
+    - [component, "Given the board view was deleted in Notion, When setup-board runs, Then it is recreated identically"]
+  dod: ["Screenshot of the board on phone attached to PR", "docs/boards.md explains allowed drags"]
+  risks: "Notion reports edits by user, so 'is this Doc?' depends on Doc's Notion user id being configured; tested as a guardrail."
+
+- id: S10.6
+  title: "Spike: can Paperclip's Board view drag and drop?"
+  pts: 2
+  deps: [S04.1, S04.6]
+  story: As the builder, I want to know whether Paperclip's own Board view supports dragging issues between status columns, and how it can be extended, so that we choose between configuring Paperclip (S10.7) and building our own board (S10.8).
+  context: "Paperclip's docs describe a Board view on the Issues page with card density, cold-lane mode and column page size, but they describe changing status through a Properties picker and do not mention dragging. They also list a Plugin SDK. Timebox: 1 day on the pinned Paperclip version. Check: drag between status columns on desktop and phone browsers; whether drags respect checkout locks (an agent holding an issue); whether columns can be custom (e.g. by label stage:*) or only status; whether a plugin can add a page or view; which API calls a status change makes."
+  ac:
+    - ADR-9 records the answer (Path A configure Paperclip, or Path B build our own) with evidence (screen recording + captured API calls)
+    - The unused story (S10.7 or S10.8) is marked Won't do with a link to ADR-9
+  tasks:
+    - t: Exercise the Board view on the pinned version
+      red: ["spike/test_board_status_change.py — records the API call made when status changes from the UI; fails until a fixture is captured"]
+      green: Manual exploration on desktop + phone; capture fixtures/paperclip/board_*.json
+    - t: Check the plugin SDK for custom views
+      red: ["spike/test_plugin_hello.py — a hello-world plugin page loads in the Paperclip UI (fails if the SDK can't add pages)"]
+      green: Minimal plugin, or a documented 'not possible'
+    - t: Write ADR-9
+      red: ["docs lint requires ADR-9 sections Context/Decision/Consequences and a Path field (A or B)"]
+      green: docs/adr/0009-agent-work-board.md
+  tests:
+    - [contract, "Given a status change made from the Board view, When captured, Then the request matches PATCH /api/issues/{id} with status"]
+    - [contract, "Given an issue checked out by an agent, When Doc drags it, Then the recorded behavior (allowed / refused / lock released) is documented"]
+    - [unit, "Given ADR-9, When parsed, Then Path is A or B"]
+  dod: ["Decision reviewed with Doc"]
+  risks: Paperclip ships often; re-check at each Paperclip upgrade.
+
+- id: S10.7
+  title: "Path A: configure Paperclip's Board as the agent-work board"
+  pts: 2
+  deps: [S10.6, S10.3]
+  condition: Only if ADR-9 chooses Path A (Paperclip's Board view supports drag and drop).
+  story: As Doc, I want Paperclip's own Board view set up as a parallel board of the agents' work so that I can watch and nudge what each agent is doing without leaving Paperclip.
+  context: "Columns are Paperclip issue statuses (backlog, todo, in_progress, in_review, blocked, done, cancelled). Saved board per project (Discovery, Applications, Inbox) and a 'Needs Doc' board filtered by label. Issue labels (stage:*, tier:*, agent:*) from S04.6 make cards readable. Status changes Doc makes on the board are mirrored: a webhook/poller maps meaningful moves to commands (e.g., blocked→todo = retry; any→cancelled on a job issue = Skip via the S10.3 command service), so the ledger stays the source of truth."
+  ac:
+    - Saved boards exist per project and are recreated by company-as-code apply where Paperclip supports it, or documented as one-time setup where it does not
+    - Doc's moves that have a pipeline meaning reach the ledger through the S10.3 command service; others only change the issue
+  tasks:
+    - t: Board configuration
+      red: ["test_paperclip_board_config.py — apply produces the saved views/labels expected (or the setup checklist is validated if views are UI-only)"]
+      green: company.yaml additions or docs/boards.md checklist
+    - t: Mirror meaningful moves
+      red: ["test_paperclip_board_mirror.py — fixture: issue moved to cancelled by doc → Skip command; moved by an agent → ignored"]
+      green: Status-change poller using board_rules
+  tests:
+    - [integration, "Given Doc drags an [EVALUATE] issue from blocked to todo, When mirrored, Then the Manager retries it"]
+    - [guardrail, "Given an agent changes an issue's status, When mirrored, Then no doc command is issued"]
+  dod: ["docs/boards.md updated"]
+  risks: None beyond S10.6.
+
+- id: S10.8
+  title: "Path B: JobOps Board web app (React + dnd-kit)"
+  pts: 8
+  deps: [S10.6, S10.3, S10.5]
+  condition: Only if ADR-9 chooses Path B (no drag and drop in Paperclip's Board view).
+  story: As Doc, I want a drag-and-drop Kanban web app over Paperclip and the ledger so that I get a true parallel board for the agents' work and my pipeline, usable from my phone.
+  context: "A small React + TypeScript app (Vite) in services/board_ui, using @dnd-kit/core + @dnd-kit/sortable. dnd-kit is chosen over Pragmatic drag and drop because dnd-kit uses pointer/touch sensors (Doc drives this from a phone) and has a ready sortable preset; Pragmatic, which builds on the browser's native drag API, stays the fallback if performance becomes a problem. Two modes: Pipeline (columns = ledger stages; same board_rules as S10.5; drops call the S10.3 command service as actor doc) and Agent work (columns = Paperclip issue statuses, swimlanes per agent; drops PATCH /api/issues/{id} status via a thin backend that holds the Paperclip board key). Backend: a small FastAPI 'board-api' that reads from the ledger + Paperclip REST, enforces board_rules, and pushes updates by server-sent events. Served only on the tailnet, with a Doc-only session token. If the S10.6 spike found the Plugin SDK can host a page, the app is packaged as a Paperclip plugin page instead of a separate site."
+  ac:
+    - Both modes render from live data and update within 5s of a change made elsewhere (Notion, Telegram, agents)
+    - Legal drops take effect; illegal drops snap back with the reason; drops on issues checked out by an agent are refused
+    - Works on mobile Safari/Chrome with touch drag; keyboard drag works (accessibility)
+    - Never exposes an action that agents can't already be refused (no 'submit', no 'send')
+  tasks:
+    - t: board-api backend
+      red: ["test_board_api.py — GET /board?mode=pipeline returns columns from ledger; GET ?mode=work returns Paperclip issues grouped by status and agent (fixtures); POST /move enforces board_rules; unauthenticated → 401"]
+      green: services/board_api (FastAPI) + SSE endpoint
+    - t: Pipeline mode UI with dnd-kit
+      red: ["board.pipeline.test.tsx — renders columns in order; simulated drag Hold→Shortlisted calls /move; rejected move snaps back and shows reason toast"]
+      green: React components (Board, Column, Card) with DndContext + SortableContext, multi-container collision detection
+    - t: Agent-work mode UI
+      red: ["board.work.test.tsx — swimlanes per agent; drop on a checked-out issue shows 'agent is working on this' and no PATCH sent"]
+      green: Work mode + lock indicator from live-run data
+    - t: Mobile, keyboard and live updates
+      red: ["Playwright e2e (mobile viewport, touch) drags a card; keyboard sensor test moves a card with Space/arrow keys; SSE update re-renders a card moved in Notion"]
+      green: TouchSensor + KeyboardSensor config, SSE client
+    - t: Packaging and access
+      red: ["test_board_access.py — app reachable on tailnet hostname only; token required; container healthcheck"]
+      green: Dockerfile, compose service, optional Paperclip plugin wrapper per ADR-9
+  tests:
+    - [component, "Given pipeline mode, When Doc drags Ready for Doc → Approved, Then the S10.3 approve command runs and Notion + Telegram reflect it"]
+    - [component, "Given work mode, When Doc drags a blocked [TAILOR] issue to todo, Then Paperclip issue status becomes todo and the Manager picks it up next sweep"]
+    - [guardrail, "Given an issue checked out by an agent, When dropped elsewhere, Then no status change is sent"]
+    - [guardrail, "Given a request without Doc's session token, When POST /move, Then 401 and nothing changes"]
+    - [e2e, "Given a phone-sized viewport, When a card is touch-dragged between columns, Then the move succeeds"]
+    - [unit, "Given the same board_rules as S10.5, When compared, Then Notion and the web board allow exactly the same moves"]
+  dod: ["Lighthouse accessibility score ≥ 90", "docs/boards.md covers both boards"]
+  risks: "Two boards can disagree for a few seconds; the ledger wins and both re-sync from it."

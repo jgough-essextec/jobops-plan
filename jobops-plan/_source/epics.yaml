@@ -1,0 +1,151 @@
+- id: E00
+  slug: foundations-spikes
+  name: Foundations & discovery spikes
+  goal: Stand up the repo, CI and runtime on the Spark, and de-risk the three external projects (career-ops, Paperclip+Hermes, JobSpy) by capturing their real contracts as fixtures before any wrapper is written.
+  why: All three upstream projects are young and fast-moving, and career-ops was built to be driven interactively by an AI CLI. Building wrappers against assumed interfaces is the biggest risk in the plan.
+  in_scope: [Monorepo + CI, three contract-capture spikes with ADRs and fixtures, docker compose runtime on the Spark, LiteLLM routing incl. a mock route]
+  out_scope: [Any agent behavior, any production wrapper code]
+  deps: []
+  exit:
+    - CI runs unit + contract suites on every PR in under 10 minutes
+    - ADR-1..ADR-8 written and accepted by Doc
+    - Fixture packs exist for career-ops, Paperclip API/adapter and JobSpy, each with a README stating the upstream commit/version
+    - "`docker compose up` on the Spark brings Paperclip, LiteLLM and placeholder services up healthy"
+- id: E01
+  slug: domain-ledger
+  name: Domain core & pipeline ledger
+  goal: Build the JobOps Ledger, the single source of truth for every job, its artifacts, reviews and inbox events, with a guarded state machine and an MCP surface agents use.
+  why: Every agent coordinates through job state. Getting the state machine and idempotency right first makes every later story simpler to test.
+  in_scope: [Pydantic domain model + JSON Schema export, state machine, SQLite store + migrations + event log, ledger-mcp]
+  out_scope: [Projections to Notion/Paperclip (E10/E04)]
+  deps: [E00]
+  exit:
+    - Every transition in PLAN §4 is covered by a test; every illegal transition is rejected
+    - Event log is append-only and replayable to rebuild current state
+    - ledger-mcp contract tests green
+- id: E02
+  slug: jobspy-discovery
+  name: JobSpy discovery service
+  goal: Wrap JobSpy as a resilient, typed discovery service that turns search profiles into normalized, de-duplicated, pre-screened Job records.
+  why: Raw JobSpy output varies by site, includes duplicates across boards and fails per site under rate limits. Agents need a clean, stable tool.
+  in_scope: [Search profile config, runner + normalization, fingerprint dedup, resilience, hard filters, jobspy-mcp]
+  out_scope: [LLM evaluation (E03/E06)]
+  deps: [E00, E01]
+  exit:
+    - A search profile run produces normalized Jobs with < 2% duplicates on the fixture corpus
+    - A site failure never fails the whole run
+    - jobspy-mcp contract tests green
+- id: E03
+  slug: careerops-bridge
+  name: career-ops bridge
+  goal: Integrate career-ops as a pinned dependency and expose its evaluation, tailoring, PDF, scanning and tracker capabilities as validated, typed tools.
+  why: career-ops holds the domain intelligence (A–F evaluation, ATS-oriented CVs). The bridge makes it callable by agents with schema-checked outputs and a no-fabrication guarantee.
+  in_scope: [Submodule + doctor, profile/master CV, evaluation contract, tailoring contract with provenance, PDF + ATS check, tracker reconciliation, portal scan, careerops-mcp]
+  out_scope: [Deciding which jobs to tailor (E05)]
+  deps: [E00, E01, E02]
+  exit:
+    - Evaluation and tailoring outputs are schema-validated; invalid output is rejected with a reason
+    - Provenance check flags 100% of seeded fabricated claims in the fixture set
+    - Upgrading the submodule runs the contract suite and fails loudly on breaking change
+- id: E04
+  slug: paperclip-hermes-runtime
+  name: Paperclip company & Hermes runtime
+  goal: Run Paperclip with five Hermes agents defined as code, with least-privilege tools, budgets and heartbeats, plus a fake-Hermes harness so orchestration can be tested without LLMs.
+  why: This is the orchestration backbone; company-as-code and fake Hermes are what make it testable.
+  in_scope: [Install + health, fake-hermes harness, company-as-code apply/drift, prompt templates + skills, budgets/heartbeats/toolsets, issue conventions library]
+  out_scope: [Agent decision logic (E05–E09)]
+  deps: [E00, E01]
+  exit:
+    - "`jobops company apply` is idempotent and reports drift"
+    - An integration test assigns an issue to each agent and observes fake-Hermes run + report back
+    - Each agent can only reach its allow-listed MCP tools (verified by test)
+- id: E05
+  slug: manager-agent
+  name: Manager agent
+  goal: The Manager sweeps the ledger, creates and assigns work to the right agent, enforces tiers and revision caps, detects stalls and keeps Doc informed with a daily digest.
+  why: Doc asked for a manager that oversees the process; this is the control loop.
+  in_scope: [Sweep + idempotent issue creation, tier routing, stall detection/escalation, daily digest, revision loop control]
+  out_scope: [Doing the specialist work itself]
+  deps: [E01, E03, E04, E10]
+  exit:
+    - With fake Hermes, a seeded ledger is routed end to end with zero duplicate issues across 10 consecutive heartbeats
+    - Stalled items escalate within one heartbeat of breaching SLA
+- id: E06
+  slug: scout-agent
+  name: Scout agent (search)
+  goal: The Scout runs searches on schedule, records discoveries, and evaluates new roles with career-ops so the Manager can route by tier.
+  why: The front of the funnel; quality here sets the whole pipeline's signal-to-noise.
+  in_scope: [Scheduled search via jobspy-mcp + career-ops scan, evaluation, profile tuning proposals, behavior evals]
+  out_scope: [Changing search profiles without Doc's approval]
+  deps: [E02, E03, E04, E05, E10]
+  exit:
+    - Scout eval suite meets scoring-consistency target (same JD scored within ±0.5 across 3 runs)
+    - No duplicate evaluations in a 7-day shadow run
+- id: E07
+  slug: tailor-agent
+  name: Tailor agent (artifacts)
+  goal: The Tailor creates and revises the artifact set (tailored CV, cover letter, PDF) for shortlisted jobs, versioned and traceable.
+  why: This is the "agent to update the artifacts" Doc asked for.
+  in_scope: [Artifact set generation, revision from feedback, versioned artifact store, behavior evals]
+  out_scope: [Approving its own work]
+  deps: [E01, E03, E04, E05]
+  exit:
+    - Every artifact version links to inputs, model, prompt version and master-CV hash
+    - Revision addresses 100% of Critic findings marked must-fix in eval set
+- id: E08
+  slug: critic-agent
+  name: Critic agent (review)
+  goal: The Critic reviews every artifact set with deterministic checks plus an independent judge model, and either sends it back with findings or hands it to Doc for approval.
+  why: This is the "agent to review the artifacts before I do" Doc asked for.
+  in_scope: [Rubric as code, deterministic pre-checks, judge execution + verdicts, hand-off to Doc, calibration evals]
+  out_scope: [Rewriting artifacts itself]
+  deps: [E03, E04, E07, E10]
+  exit:
+    - Catch rate ≥ 90% on seeded defects, false-positive rate ≤ 15%
+    - Nothing reaches READY_FOR_DOC without a PASS verdict recorded
+- id: E09
+  slug: concierge-agent
+  name: Concierge agent (inbox)
+  goal: The Concierge watches Doc's inbox, classifies job-related messages, ties them to applications, updates the ledger and creates decision briefs with draft replies for Doc.
+  why: This is the "agent to watch my inbox and create things for me to consider" Doc asked for.
+  in_scope: [Gmail/IMAP connector with fakes, classification, thread matching, decision briefs + drafts, ledger transitions, privacy and injection defenses]
+  out_scope: [Sending email, accepting/declining anything]
+  deps: [E00, E01, E04, E05]
+  exit:
+    - ≥ 95% correct application match and ≥ 90% classification accuracy on the labeled mailbox fixture
+    - No code path can send an email (guardrail test)
+- id: E10
+  slug: human-interface
+  name: Human interface (Notion, Telegram, approvals)
+  goal: Give Doc a phone-first way to see the pipeline and act on it — Notion as the tracker, Telegram for alerts and one-tap decisions, Paperclip approvals as the system of record.
+  why: Doc is the board. Decisions must be fast and must land back in the ledger correctly.
+  in_scope: [Notion projection + inbound commands, Telegram bot, approval workflow, feedback capture, "Kanban boards — a Notion pipeline board, and a parallel agent-work board (Paperclip's Board view or our own dnd-kit web app, decided by a spike)"]
+  out_scope: [Submitting applications on Doc's behalf]
+  deps: [E00, E01, E04, E08]
+  exit:
+    - Approve/Revise/Skip from Telegram updates Paperclip approval, ledger and Notion within 60s
+    - Notion projection can be rebuilt from the ledger with no diff
+    - Both Kanban boards allow exactly the moves in board_rules.yaml, and a drag on either reaches the ledger as actor doc
+- id: E11
+  slug: observability-safety
+  name: Observability, safety & governance
+  goal: Make cost, behavior and provenance visible, and enforce the safety guarantees as a release-blocking test suite.
+  why: Autonomous agents with access to an inbox and a CV need provable limits.
+  in_scope: [Cost tracking + alerts, audit/provenance, guardrail suite, backup/restore + secrets]
+  out_scope: []
+  deps: [E00, E01, E03, E04, E07, E09, E10]
+  exit:
+    - Guardrail suite is a required CI check and passes
+    - Restore drill from backup succeeds in < 15 min
+    - Per-agent and per-job cost visible in a daily report
+- id: E12
+  slug: integration-release
+  name: Integration, shadow run & release
+  goal: Prove the whole system end to end, run it in shadow on the Spark with real models, write the runbook and complete a pilot week against the success metrics.
+  why: Confidence that the parts work together, with real data, before Doc relies on it.
+  in_scope: [E2E suite with fakes, live shadow run, runbook, pilot + tuning]
+  out_scope: []
+  deps: [E05, E06, E07, E08, E09, E10, E11]
+  exit:
+    - E2E happy path and revision path green in CI
+    - Pilot week meets PLAN §1 success metrics or has an accepted remediation list

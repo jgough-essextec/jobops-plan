@@ -1,0 +1,436 @@
+# ---------------- E00 ----------------
+- id: S00.1
+  title: Monorepo scaffold and CI
+  pts: 3
+  deps: []
+  story: As the builder, I want a monorepo with Python and TypeScript toolchains and CI so that every later story starts from a red-green-refactor loop that is enforced automatically.
+  context: Python (uv, pytest, hypothesis, ruff, mypy) for services; TypeScript (pnpm, vitest, tsc) for Paperclip-side tooling and the Telegram bot. GitHub Actions. Make targets wrap everything so agents and humans run the same commands.
+  ac:
+    - "`make test` runs unit + contract suites for both languages"
+    - CI fails a PR if coverage of changed lines < 90% or lint/type-check fails
+    - A PR template contains the Task DoD and Story DoD checklists from PLAN §6
+  tasks:
+    - t: Create repo layout from PLAN §8 with placeholder packages
+      red: ["test_layout.py asserts required top-level dirs and pyproject/package.json exist"]
+      green: Scaffold dirs, pyproject.toml (uv workspace), pnpm-workspace.yaml
+    - t: Wire test runners and a sample failing-then-passing test per language
+      red: ["tests/test_smoke.py::test_truth fails until runner config is correct", "smoke.test.ts fails until vitest config resolves workspace"]
+      green: Configure pytest, vitest, coverage reporters
+    - t: CI workflow with coverage gate and diff-coverage
+      red: ["A deliberately uncovered branch on a throwaway PR causes CI to fail (recorded in PR)"]
+      green: GitHub Actions workflow; diff-cover at 90%
+    - t: Pre-commit hooks and PR template
+      red: ["pre-commit run --all-files fails on a seeded lint error"]
+      green: ruff, mypy, prettier, detect-secrets hooks; .github/pull_request_template.md
+  tests:
+    - [unit, "Given a fresh clone, When `make test` runs, Then both suites execute and exit 0"]
+    - [unit, "Given a file containing an AWS-style key, When pre-commit runs, Then detect-secrets blocks the commit"]
+    - [integration, "Given a PR with an uncovered new function, When CI runs, Then the coverage gate fails with the file and line listed"]
+    - [unit, "Given a type error in a service, When `make typecheck` runs, Then it exits non-zero"]
+  dod: ["CI badge on README", "Branch protection on main requires CI"]
+  risks: None material.
+
+- id: S00.2
+  title: "Spike: career-ops headless contract capture"
+  pts: 5
+  deps: [S00.1]
+  story: As the builder, I want to know exactly how career-ops can be driven without an interactive CLI session so that the bridge (E03) is designed against reality, not assumptions.
+  context: "career-ops is driven from an AI coding CLI via slash-command modes (`modes/*.md`), with Node scripts for PDF (Playwright), tracker merge/dedup, `npm run doctor`, a portal scanner, and config in `config/profile.yml` plus a master CV. Timebox: 2 days. Output is knowledge + fixtures, not production code."
+  ac:
+    - ADR-3 written, choosing which career-ops parts run in the bridge vs. as Hermes skills
+    - "Inventory doc lists every mode, script, input file and output file with formats and example paths"
+    - "`fixtures/careerops/` contains a synthetic profile, master CV, 3 JDs, and the real outputs career-ops produced for them (evaluation report, tailored CV, PDF, tracker rows)"
+    - Upstream commit SHA recorded
+  tasks:
+    - t: Install career-ops on the Spark and run doctor
+      red: ["spike/test_doctor.py expects `npm run doctor` exit 0 in the vendored checkout (fails until installed)"]
+      green: Clone, npm install, playwright chromium, doctor green
+    - t: Run each relevant mode once via Hermes (or Claude Code) against a synthetic profile and capture outputs
+      red: ["spike/test_fixture_pack.py asserts expected fixture files exist and are non-empty"]
+      green: Execute evaluation, tailoring, pdf, scan, tracker modes; save outputs to fixtures
+    - t: Derive output schemas from captured artifacts
+      red: ["test_schemas.py validates each captured output against a draft JSON Schema (fails until schemas written)"]
+      green: Write schemas/careerops/*.schema.json
+    - t: Write ADR-3 and the inventory doc
+      red: ["docs lint check requires ADR-3 sections Context/Decision/Consequences"]
+      green: docs/adr/0003-careerops-split.md, docs/careerops-inventory.md
+  tests:
+    - [contract, "Given the captured evaluation report, When validated against evaluation.schema.json, Then it passes and has a score in 1–5 and grade A–F"]
+    - [contract, "Given the captured tailored CV, When parsed, Then section headings match the inventory"]
+    - [contract, "Given the captured PDF, When text-extracted, Then the candidate name and at least one JD keyword are present"]
+    - [unit, "Given the fixture pack README, When read, Then it contains an upstream commit SHA"]
+  dod: ["Spike findings reviewed with Doc", "Open questions logged as issues against S03.x"]
+  risks: If career-ops modes can't produce structured output reliably, fallback is to wrap its prompts in our own JSON-mode prompts (record in ADR-3).
+
+- id: S00.3
+  title: "Spike: Paperclip + hermes_local contract capture"
+  pts: 5
+  deps: [S00.1]
+  story: As the builder, I want the real Paperclip REST endpoints and hermes_local adapter behavior captured so that company-as-code, the fake Hermes harness and the Manager's API calls are built against facts.
+  context: "Paperclip: companies, org chart, issues, comments, approvals, budgets, heartbeats, audit, REST API (and an MCP server package). hermes_local runs `hermes chat -q` per run with promptTemplate variables (agentId, companyId, runId, taskId, taskTitle, taskBody, projectName, paperclipApiUrl, commentId, wakeReason), `persistSession` via `--resume`, `toolsets`, `timeoutSec`, `hermesCommand`, `env`. Docs and adapter README differ on some keys — resolve here."
+  ac:
+    - "Captured request/response JSON for: create company, create agent, create/update/comment issue, assign, checkout, approval request/resolve, budget read, cost report"
+    - Verified that `hermesCommand` can point to an arbitrary executable and that Paperclip records its output as a run (proves ADR-7)
+    - Resolved key discrepancies (e.g. `toolsets` vs `enabledToolsets`, default `timeoutSec`) documented with versions
+  tasks:
+    - t: Install pinned Paperclip + Hermes + adapter on the Spark
+      red: ["spike/test_paperclip_health.py expects GET /api health 200 (fails until running)"]
+      green: Install, onboard, record versions
+    - t: Record API interactions as fixtures
+      red: ["test_api_fixtures.py asserts each listed interaction fixture exists with status + body"]
+      green: Script with httpx + recording to fixtures/paperclip/*.json
+    - t: Prove the hermesCommand seam with a 10-line echo script
+      red: ["spike/test_hermes_seam.py assigns an issue to an agent with hermesCommand=./echo-hermes and expects a run transcript containing the echo"]
+      green: Echo script + agent config
+    - t: Write ADR-6 (company-as-code) and ADR-7 (fake Hermes) with findings
+      red: ["docs lint for ADR sections"]
+      green: ADRs + docs/paperclip-contracts.md
+  tests:
+    - [contract, "Given fixture create_issue.json, When replayed against the pinned server, Then response shape matches the recorded schema"]
+    - [contract, "Given an agent with hermesCommand=echo-hermes, When an issue is assigned, Then Paperclip records one run with wakeReason=assignment"]
+    - [contract, "Given an issue comment mentioning the agent, When posted, Then a run is triggered with commentId populated"]
+    - [contract, "Given an agent at 100% budget, When assigned work, Then Paperclip blocks the run (captures the behavior we test against later)"]
+  dod: ["Versions pinned in compose.yml", "Discrepancies list closed or ticketed"]
+  risks: Fast-moving upstream; pin versions and plan a quarterly upgrade story.
+
+- id: S00.4
+  title: "Spike: JobSpy output schema and rate-limit behavior"
+  pts: 3
+  deps: [S00.1]
+  story: As the builder, I want recorded JobSpy outputs per site and observed failure modes so that normalization and resilience are tested against real data.
+  context: "`scrape_jobs(site_name, search_term, google_search_term, location, distance, job_type, results_wanted, hours_old, country_indeed, linkedin_fetch_description, description_format, proxies)` returns a DataFrame. Endpoints cap around 1000 results; 429 on aggressive use."
+  ac:
+    - Parquet fixtures for each enabled site (indeed, linkedin, google, zip_recruiter, glassdoor) for 2 search terms
+    - Column inventory with null rates per site
+    - Observed failure modes documented (429, empty results, partial descriptions) with reproduction notes
+  tasks:
+    - t: Run controlled scrapes and save DataFrames
+      red: ["spike/test_jobspy_fixtures.py asserts ≥1 parquet per site with ≥5 rows"]
+      green: Script that scrapes with small results_wanted and saves parquet + metadata
+    - t: Profile columns and nulls
+      red: ["test_column_inventory.py asserts inventory covers every column present in fixtures"]
+      green: Generate docs/jobspy-columns.md
+    - t: Characterize rate limiting
+      red: ["test_failure_catalog.py expects catalog entries for 429 and empty-result cases"]
+      green: Record exceptions/messages; docs/jobspy-failures.md
+  tests:
+    - [contract, "Given each site fixture, When loaded, Then columns title, company, job_url, site exist"]
+    - [contract, "Given the linkedin fixture without fetch_description, When inspected, Then description null rate is recorded (expected high)"]
+    - [unit, "Given the failure catalog, When parsed, Then each entry has site, symptom, exception type, mitigation"]
+  dod: ["JobSpy version pinned"]
+  risks: Live scraping in a spike only; never in CI.
+
+- id: S00.5
+  title: Runtime environment on the GB10 Spark
+  pts: 5
+  deps: [S00.3]
+  story: As Doc, I want the whole stack to start with one command on the Spark and be reachable over Tailscale so that I can run and manage it from my phone.
+  context: "docker compose: paperclip, litellm, ledger, jobspy_svc, careerops_bridge, inbox, notion_sync, telegram_bot. LiteLLM routes: nemotron (local vLLM), claude-opus, gemini, plus a `mock/*` route returning scripted completions for tests. Secrets via sops-encrypted .env."
+  ac:
+    - "`make up` brings all containers healthy; `make down` cleans up"
+    - LiteLLM has per-agent virtual keys and a mock route
+    - Paperclip UI reachable only via Tailscale hostname
+  tasks:
+    - t: compose.yml with healthchecks for every service
+      red: ["tests/integration/test_stack_health.py waits for all healthchecks (fails until compose defined)"]
+      green: compose.yml + Dockerfiles for placeholder services
+    - t: LiteLLM config with real and mock routes and per-agent keys
+      red: ["test_litellm_routes.py calls mock/echo and expects scripted reply; calls with agent key and expects spend tagged to agent"]
+      green: litellm/config.yaml, mock provider
+    - t: Secrets handling with sops
+      red: ["test_no_plaintext_secrets.py scans repo for .env without .sops suffix"]
+      green: sops config, decrypt-on-up script
+    - t: Tailscale-only exposure
+      red: ["test_bindings.py asserts no service binds 0.0.0.0 on host ports except via tailscale sidecar"]
+      green: tailscale sidecar or bind to tailnet IP
+  tests:
+    - [integration, "Given a clean Spark, When `make up`, Then all services report healthy within 120s"]
+    - [integration, "Given the mock route with script 'hello', When an agent key calls it, Then the reply is 'hello' and spend is logged under that key"]
+    - [unit, "Given the repo, When secret scan runs, Then no plaintext secret files exist"]
+    - [integration, "Given a device outside the tailnet, When it hits the host port, Then the connection is refused"]
+  dod: ["docs/runtime.md written", "Restart policy set to unless-stopped"]
+  risks: GPU memory contention between vLLM and other workloads on the Spark — document limits.
+
+# ---------------- E01 ----------------
+- id: S01.1
+  title: Domain model and schemas
+  pts: 3
+  deps: [S00.2, S00.4]
+  story: As every agent and service, I want one typed domain model so that data passed between tools is validated in one place.
+  context: "Pydantic v2 models: Job, Company, SearchProfile, Evaluation, ArtifactSet, ArtifactVersion, Review, Finding, InboxEvent, DecisionBrief, Actor. Export JSON Schema for TS consumers and MCP tool definitions. Shapes informed by S00.2/S00.4 fixtures."
+  ac:
+    - All models round-trip JSON without loss
+    - JSON Schemas generated into schemas/ and checked in; CI fails if stale
+    - Fixture records from S00.2/S00.4 parse into the models
+  tasks:
+    - t: Define models with validators
+      red: ["test_models.py — property tests (hypothesis) for round-trip; validation errors for bad grades, negative salaries, missing job_url"]
+      green: services/ledger/domain.py
+    - t: Schema export and staleness check
+      red: ["test_schema_fresh.py regenerates schemas and diffs against checked-in copies"]
+      green: make schemas target
+    - t: Fixture parsing
+      red: ["test_fixture_parse.py loads every career-ops and JobSpy fixture into models"]
+      green: Adapters for fixture shapes
+  tests:
+    - [unit, "Given any valid Job generated by hypothesis, When dumped and loaded, Then it equals the original"]
+    - [unit, "Given an Evaluation with grade 'G', When constructed, Then ValidationError"]
+    - [unit, "Given salary_min > salary_max, When constructing Job, Then ValidationError"]
+    - [contract, "Given checked-in schemas, When regenerated, Then no diff"]
+  dod: ["Schema version constant SCHEMA_VERSION=1"]
+  risks: None.
+
+- id: S01.2
+  title: Pipeline state machine
+  pts: 5
+  deps: [S01.1]
+  story: As the Manager, I want a guarded state machine for jobs so that agents can only move work forward along legal paths and every move is attributable.
+  context: "States and transitions from PLAN §4. Guards: actor permissions per transition (e.g. only `doc` → APPLIED; only Critic → READY_FOR_DOC; revision count ≤ 2 for REVISE). Pure logic, no IO."
+  ac:
+    - Transition table is data (YAML) and the diagram in PLAN §4 is generated from it
+    - Illegal transitions raise IllegalTransition with from/to/actor
+    - Actor guards enforced; revision cap enforced
+  tasks:
+    - t: Transition table and engine
+      red: ["test_transitions.py — parametrized over every legal edge (passes) and a generated set of illegal edges (raises)"]
+      green: services/ledger/state_machine.py + transitions.yaml
+    - t: Actor guards
+      red: ["test_guards.py — scout cannot set READY_FOR_DOC; only doc can set APPLIED/APPROVED"]
+      green: Guard map in transitions.yaml
+    - t: Revision cap
+      red: ["test_revision_cap.py — third REVISE from Critic transitions to ESCALATED instead"]
+      green: Counter-aware guard
+    - t: Diagram generation
+      red: ["test_diagram.py — generated mermaid includes every state"]
+      green: make diagram
+  tests:
+    - [unit, "Given DISCOVERED, When scout transitions to EVALUATED, Then succeeds"]
+    - [unit, "Given DRAFTED, When tailor transitions to READY_FOR_DOC, Then IllegalTransition (actor)"]
+    - [guardrail, "Given APPROVED, When any agent (non-doc) transitions to APPLIED, Then IllegalTransition"]
+    - [unit, "Given IN_REVIEW with revision_count=2, When critic issues REVISE, Then state becomes ESCALATED"]
+    - [unit, "Given ARCHIVED, When any transition attempted, Then IllegalTransition (terminal)"]
+    - [unit, "Given hypothesis random walks over legal edges, When replayed, Then never reaches an undefined state"]
+  dod: ["transitions.yaml reviewed by Doc"]
+  risks: None.
+
+- id: S01.3
+  title: Ledger store, migrations and event log
+  pts: 5
+  deps: [S01.2]
+  story: As the system, I want job state persisted with an append-only event log so that state is durable, auditable and rebuildable.
+  context: "SQLite (WAL) via SQLAlchemy + Alembic. Tables: jobs, evaluations, artifact_sets, artifact_versions, reviews, inbox_events, events (append-only). Idempotent upsert keyed by job fingerprint. Optimistic concurrency via version column."
+  ac:
+    - Every transition writes exactly one event row in the same DB transaction
+    - Replay of events reproduces current job state exactly
+    - Concurrent writers on same job → one wins, the other gets ConcurrencyError
+  tasks:
+    - t: Schema + migrations
+      red: ["test_migrations.py — upgrade head on empty DB then downgrade base succeeds"]
+      green: Alembic env + initial migration
+    - t: Repository with idempotent upsert
+      red: ["test_repo.py — upsert same fingerprint twice yields one row, merged sources"]
+      green: LedgerRepository
+    - t: Event log + replay
+      red: ["test_replay.py — random sequence of transitions; rebuild from events equals live state"]
+      green: events table, replay()
+    - t: Optimistic concurrency
+      red: ["test_concurrency.py — two sessions update same job; second raises ConcurrencyError"]
+      green: version column check
+  tests:
+    - [component, "Given a job transitioned 5 times, When events queried, Then 5 rows in order with actor ids"]
+    - [component, "Given a DB, When attempting UPDATE/DELETE on events via repository, Then refused (append-only)"]
+    - [component, "Given events from a fixture, When replayed into empty DB, Then job states match snapshot"]
+    - [component, "Given two concurrent transitions, When both commit, Then exactly one succeeds"]
+  dod: ["DB file path configurable; WAL enabled"]
+  risks: SQLite write contention — acceptable at personal scale; revisit if agents grow.
+
+- id: S01.4
+  title: ledger-mcp server
+  pts: 3
+  deps: [S01.3]
+  story: As a Hermes agent, I want ledger operations as MCP tools so that I can read and move jobs without database access.
+  context: "Tools: ledger.get_job, ledger.list_by_state, ledger.transition (actor taken from the authenticated agent key, never from args), ledger.attach_evaluation, ledger.attach_artifact_version, ledger.attach_review, ledger.record_inbox_event. Per-agent tool allow-lists enforced server-side."
+  ac:
+    - Tool schemas derived from domain JSON Schemas
+    - Actor identity comes from the MCP connection credential
+    - Agent calling a tool outside its allow-list gets a permission error
+  tasks:
+    - t: MCP server skeleton with tool registry
+      red: ["test_mcp_tools.py — list_tools returns the expected names and schemas"]
+      green: FastMCP server
+    - t: Identity + allow-list enforcement
+      red: ["test_mcp_authz.py — scout key calling attach_review → PermissionDenied; actor arg in payload is ignored"]
+      green: Credential → actor mapping; allow-list config
+    - t: Error mapping
+      red: ["test_mcp_errors.py — IllegalTransition surfaces as structured tool error with from/to"]
+      green: Exception → MCP error mapping
+  tests:
+    - [contract, "Given the MCP client, When list_tools, Then schemas validate against schemas/*.json"]
+    - [guardrail, "Given the tailor's key, When calling ledger.transition to READY_FOR_DOC, Then PermissionDenied"]
+    - [component, "Given a payload with actor='doc' from the scout's key, When transition called, Then event actor is 'scout'"]
+    - [component, "Given list_by_state(EVALUATED, limit=10), When 25 exist, Then 10 returned with a cursor"]
+  dod: ["Tool docs generated into paperclip/skills/ledger/SKILL.md"]
+  risks: None.
+
+# ---------------- E02 ----------------
+- id: S02.1
+  title: Search profile configuration
+  pts: 2
+  deps: [S01.1]
+  story: As Doc, I want my searches defined in one validated config file so that what the Scout looks for is explicit and changes are reviewable.
+  context: "search_profiles.yaml: name, search_term, google_search_term, locations[], remote_ok, sites[], hours_old, job_type, results_wanted, exclusions (companies, title keywords), min_salary, seniority, enabled. Changes go through Doc approval (S06.3)."
+  ac:
+    - Invalid profiles fail validation with field-level messages
+    - Profiles hash-versioned; each run records the profile hash used
+  tasks:
+    - t: Profile model + loader
+      red: ["test_profiles.py — valid sample loads; unknown site rejected; results_wanted > 1000 rejected"]
+      green: SearchProfile model, loader
+    - t: Profile hashing
+      red: ["test_profile_hash.py — whitespace-only change keeps hash; semantic change alters it"]
+      green: Canonical JSON hash
+  tests:
+    - [unit, "Given site 'monster' (unsupported), When loading, Then error names the field and allowed values"]
+    - [unit, "Given two semantically equal profiles with different key order, When hashed, Then equal"]
+    - [unit, "Given enabled=false, When listing runnable profiles, Then excluded"]
+  dod: ["Example profiles for Doc's target roles committed (no PII)"]
+  risks: None.
+
+- id: S02.2
+  title: JobSpy runner and normalization
+  pts: 5
+  deps: [S02.1, S00.4]
+  story: As the Scout, I want each profile run turned into normalized Job records so that downstream steps never deal with per-site quirks.
+  context: "Map DataFrame columns to Job: title, company, company_url, location (city/state/country/remote), job_type, salary (interval → annualized min/max/currency), date_posted, job_url (canonicalized), job_url_direct, description (markdown), site, raw (JSON). JobSpy is called behind an interface so tests use fixture replay."
+  ac:
+    - Every fixture row normalizes or is rejected with a reason
+    - Hourly/monthly salaries annualized with recorded assumption (2080h, 12mo)
+    - Tracking params stripped from URLs
+  tasks:
+    - t: JobSource interface + fixture replay implementation
+      red: ["test_source.py — FixtureSource returns DataFrames from parquet by (site, term)"]
+      green: JobSource protocol, JobSpySource, FixtureSource
+    - t: Column mapping + salary normalization
+      red: ["test_normalize.py — per-site fixture rows map; hourly 65–75 → 135,200–156,000 annual"]
+      green: normalize.py
+    - t: URL canonicalization
+      red: ["test_urls.py — utm_*, trk, refId stripped; linkedin /jobs/view/<id> canonical form"]
+      green: canonical_url()
+    - t: Run orchestration
+      red: ["test_runner.py — run(profile) calls source per site and returns NormalizedBatch with per-site counts"]
+      green: Runner
+  tests:
+    - [contract, "Given every site fixture, When normalized, Then 100% rows produce Job or RejectedRow with reason"]
+    - [unit, "Given interval='hourly' min=65 max=75, When normalized, Then annual 135200–156000 and salary_assumption='2080h'"]
+    - [unit, "Given is_remote=True and empty city, When normalized, Then location.remote=True"]
+    - [unit, "Given a URL with utm_source and trk, When canonicalized, Then params removed and host lowercased"]
+    - [unit, "Given hypothesis-generated messy strings, When normalizing title/company, Then no exceptions and trimmed output"]
+  dod: ["Normalization rules documented in docs/jobspy-normalization.md"]
+  risks: Upstream column changes → caught by contract tests on version bump.
+
+- id: S02.3
+  title: Dedup and fingerprinting
+  pts: 5
+  deps: [S02.2, S01.3]
+  story: As Doc, I want each real job to appear once even when it's on four boards so that my review queue isn't noise.
+  context: "Fingerprint = hash(normalized company, normalized title, location bucket) with a fuzzy secondary match (rapidfuzz ≥ 92 on title within same company and 14-day window). Exact match on canonical job_url_direct wins. Merged record keeps all sources. Dedup runs within a batch and against the ledger."
+  ac:
+    - "< 2% duplicates on the labeled fixture corpus (labels in fixtures/dedup_labels.csv)"
+    - No false merges across different companies in the corpus
+    - Merged job lists every source site and URL
+  tasks:
+    - t: Labeled dedup corpus
+      red: ["test_dedup_corpus.py — corpus has ≥ 200 rows with cluster labels"]
+      green: Build labels from S00.4 fixtures
+    - t: Fingerprint + fuzzy matcher
+      red: ["test_fingerprint.py — 'Sr. ML Engineer' vs 'Senior Machine Learning Engineer' same company → match; different company → no match"]
+      green: fingerprint.py with abbreviation expansion table
+    - t: Batch + ledger dedup
+      red: ["test_dedup_ledger.py — job already in ledger (any state) is not re-created; sources appended"]
+      green: Dedup service using LedgerRepository.upsert
+    - t: Metrics
+      red: ["test_dedup_metrics.py — precision/recall computed on corpus and asserted ≥ thresholds"]
+      green: Evaluation script used in CI
+  tests:
+    - [unit, "Given identical job_url_direct from indeed and google, When deduped, Then one Job with 2 sources"]
+    - [unit, "Given same title at 'Acme Inc' and 'Acme, Inc.', When fingerprinted, Then equal"]
+    - [unit, "Given same title at different companies, When deduped, Then two Jobs"]
+    - [component, "Given a job ARCHIVED last week, When rediscovered, Then not resurrected; sources updated; event 'rediscovered' logged"]
+    - [eval, "Given labeled corpus, When deduped, Then pairwise precision ≥ 0.99 and recall ≥ 0.95"]
+  dod: ["Thresholds in config, not code"]
+  risks: Reposted roles with new IDs — window + fuzzy match handles most.
+
+- id: S02.4
+  title: Resilience — rate limits, backoff, proxies, per-site isolation
+  pts: 3
+  deps: [S02.2]
+  story: As the Scout, I want a run to degrade gracefully when a board blocks us so that one site's failure never costs the whole search.
+  context: Retry with exponential backoff + jitter on 429/5xx; per-site circuit breaker (open after 3 consecutive failures, half-open after cooldown); optional proxy list rotation; per-site results_wanted cap; politeness delay between sites.
+  ac:
+    - A failing site yields a partial result with a SiteFailure record; others succeed
+    - Circuit breaker state persists across runs (in ledger metadata)
+  tasks:
+    - t: Retry policy
+      red: ["test_retry.py — fake source raising 429 twice then succeeding → result returned after 3 calls; delays follow backoff"]
+      green: tenacity-based wrapper
+    - t: Circuit breaker
+      red: ["test_breaker.py — 3 failures opens; calls short-circuit until cooldown; success closes"]
+      green: Breaker with persisted state
+    - t: Proxy rotation
+      red: ["test_proxy.py — proxies passed through to scrape_jobs in round-robin; failed proxy quarantined"]
+      green: ProxyPool
+  tests:
+    - [component, "Given linkedin raises 429 always and indeed succeeds, When run, Then batch has indeed jobs and one SiteFailure(linkedin, '429')"]
+    - [unit, "Given breaker open for glassdoor, When run, Then glassdoor skipped with reason 'circuit_open'"]
+    - [unit, "Given retry policy, When 429 persists, Then gives up after max attempts within the run timeout"]
+  dod: ["Defaults documented: max 3 retries, 50 results/site"]
+  risks: Terms-of-service — keep volumes personal-scale.
+
+- id: S02.5
+  title: Hard filters and deterministic pre-screen
+  pts: 2
+  deps: [S02.3]
+  story: As Doc, I want obvious misfits dropped before any LLM spend so that cost and noise stay low.
+  context: "Rules from profile: excluded companies, excluded title keywords, min_salary (only when salary known), seniority floor (title heuristics), location/remote policy, staffing-agency detection list. Result: SCREENED_OUT with reason codes, or passes as DISCOVERED."
+  ac:
+    - Each screened-out job carries ≥ 1 reason code
+    - Unknown salary never fails the salary rule
+  tasks:
+    - t: Rule engine
+      red: ["test_filters.py — table-driven cases for each rule incl. unknown salary"]
+      green: filters.py
+    - t: Ledger integration
+      red: ["test_filter_ledger.py — screened jobs recorded SCREENED_OUT with reasons; not visible to Manager routing"]
+      green: Write via ledger repo
+  tests:
+    - [unit, "Given company on exclusion list (case-insensitive), When screened, Then SCREENED_OUT reason=excluded_company"]
+    - [unit, "Given salary unknown and min_salary set, When screened, Then passes salary rule"]
+    - [unit, "Given title 'Junior Data Analyst' and seniority floor 'director', When screened, Then SCREENED_OUT reason=seniority"]
+  dod: ["Weekly count of screened-out by reason available to digest (S05.4)"]
+  risks: Over-filtering — Doc can review SCREENED_OUT in Notion view.
+
+- id: S02.6
+  title: jobspy-mcp tool surface
+  pts: 3
+  deps: [S02.4, S02.5, S01.4]
+  story: As the Scout, I want discovery exposed as MCP tools so that I can run and preview searches with typed inputs and outputs.
+  context: "Tools: search.list_profiles, search.preview(profile, limit) (no ledger writes), search.run(profile) (writes DISCOVERED/SCREENED_OUT, returns RunSummary). Long runs return a run_id and are pollable (search.status)."
+  ac:
+    - search.run is idempotent per (profile_hash, time bucket)
+    - RunSummary includes counts: fetched, normalized, duplicates, screened_out, new, site_failures
+  tasks:
+    - t: Tool definitions
+      red: ["test_jobspy_mcp_schema.py — tool list and schemas"]
+      green: FastMCP server
+    - t: Async run + status
+      red: ["test_jobspy_mcp_run.py — run returns run_id; status transitions running→done; summary matches fixture expectations"]
+      green: Background task runner
+    - t: Idempotency
+      red: ["test_jobspy_mcp_idem.py — second run in same bucket returns existing run_id"]
+      green: Run registry keyed by profile hash + bucket
+  tests:
+    - [contract, "Given fixture source, When search.run(profile A), Then summary.new == expected count from fixtures"]
+    - [component, "Given search.preview, When called, Then ledger unchanged"]
+    - [guardrail, "Given the critic's key, When calling search.run, Then PermissionDenied"]
+  dod: ["SKILL.md for search tools written"]
+  risks: None.
