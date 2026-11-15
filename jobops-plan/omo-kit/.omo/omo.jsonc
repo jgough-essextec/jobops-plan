@@ -1,0 +1,26 @@
+// Project config for OmO (oh-my-openagent). Project file overrides ~/.omo/omo.jsonc.
+// Keys below are the documented ones (model_profile, agents.<name>.model/reasoning, categories.<name>.model).
+// Model IDs are placeholders: run `omo doctor --models` and replace them with IDs your providers expose.
+{
+  // Main session model: the orchestrator that reads the plan and delegates.
+  "model_profile": "anthropic/claude-opus-5-5",
+
+  // Read-only planning helpers used by /ulw-plan.
+  "agents": {
+    "plan-reviewer":   { "model": "anthropic/claude-opus-5-5", "reasoning": "high" },
+    "plan-consultant": { "model": "anthropic/claude-sonnet-5-5" }
+  },
+
+  // Implementation categories used by task(category: ...).
+  // Push build-and-check work to smaller models; keep design-heavy work on the big one.
+  "categories": {
+    "architect":  { "model": "anthropic/claude-opus-5-5" },   // spikes, ADRs, state machine, company-as-code
+    "deep":       { "model": "anthropic/claude-sonnet-5-5" }, // most story implementation
+    "quick":      { "model": "anthropic/claude-haiku-5-5" },  // fixtures, renderers, docs, lint fixes
+    "ultrabrain": { "model": "anthropic/claude-opus-5-5" }    // stuck debugging, cross-service failures
+  }
+
+  // Optional: route through your LiteLLM gateway instead (e.g. Nemotron for `quick`).
+  // OmO imports OpenAI-compatible providers into ~/.omo/agent/models.json (see install guide);
+  // then reference them here as "<provider-id>/<model>".
+}
