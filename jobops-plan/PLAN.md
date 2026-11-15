@@ -278,3 +278,8 @@ jobops/
 3. Hosting is the GB10 Spark; Paperclip runs locally with its default embedded database; JobOps Ledger is SQLite on the same box with nightly backup.
 4. Autonomy stays at *drafts only*: Doc approves every application, tiered by fit score.
 5. Upstream versions are pinned at the commits recorded in the E00 spikes.
+
+---
+
+## 11. How it gets built
+The build runs in **OmO (oh-my-openagent) ultrawork mode**. See `omo-kit/BUILD-WITH-OMO.md`. `omo-kit/setup-repo.sh` creates the repo with this plan under `plan/`, an `AGENTS.md` contract, `.omo/` config and rules, and `plan/tools/build_state.py`. That tool picks the next ready story from the dependency graph and parks stories that need Doc (`plan/checkpoints.yaml`).
